@@ -1,53 +1,93 @@
 from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-from fastapi.responses import FileResponse
-from datetime import date, timedelta
-import pandas as pd
+from fastapi.responses import StreamingResponse
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import csv
+import io
+import os
 
-from database import get_db
-from models import Appointment, Customer, Staff
+# =====================
+# DATABASE
+# =====================
+load_dotenv()
 
-app = FastAPI(title="Appointment Export API")
+DATABASE_URL = (
+    f"mysql+pymysql://{os.getenv('DB_USER')}:"
+    f"{os.getenv('DB_PASSWORD')}@"
+    f"{os.getenv('DB_HOST')}:"
+    f"{os.getenv('DB_PORT')}/"
+    f"{os.getenv('DB_NAME')}"
+)
 
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+app = FastAPI(title="Export Appointment API")
+
+# =====================
+# EXPORT API
+# =====================
 @app.get("/export-upcoming-appointments")
-def export_upcoming_appointments(db: Session = Depends(get_db)):
-    today = date.today()
+def export_upcoming_appointments(db=Depends(get_db)):
+    today = datetime(2025, 12, 2)
     next_7_days = today + timedelta(days=7)
 
-    results = (
-        db.query(
-            Appointment.id,
-            Appointment.appointment_date,
-            Appointment.appointment_time,
-            Appointment.status,
-            Appointment.note,
+    sql = text("""
+        SELECT
+            DATE(e.starts_on)                    AS appointment_date,
+            CONCAT_WS(' ', l.first_name, l.middle_name, l.last_name) AS full_name,
+            l.gender                       AS gender,
+            l.phone                        AS customer_phone,
+            l.email_id                     AS customer_email,
+            l.website                      AS customer_website,
+            l.fax                          AS customer_fax,
+            l.job_title                    AS title
+        FROM tabEvent e
+        LEFT JOIN `tabEvent Participants` p ON e.name = p.parent 
+            AND p.reference_doctype = 'Opportunity'
+        LEFT JOIN tabOpportunity o ON p.reference_docname = o.name
+        LEFT JOIN tabLead l ON o.party_name = l.name
+        WHERE e.starts_on >= :today
+        AND   e.starts_on < :next_7_days
+        ORDER BY e.starts_on ASC;
+    """)
 
-            Customer.name.label("customer_name"),
-            Customer.phone.label("customer_phone"),
-            Customer.email.label("customer_email"),
-
-            Staff.name.label("staff_name"),
-            Staff.department.label("staff_department"),
-        )
-        .join(Customer, Appointment.customer_id == Customer.id)
-        .join(Staff, Appointment.staff_id == Staff.id)
-        .filter(
-            Appointment.appointment_date >= today,
-            Appointment.appointment_date <= next_7_days
-        )
-        .order_by(Appointment.appointment_date, Appointment.appointment_time)
-        .all()
+    result = db.execute(
+        sql,
+        {
+            "today": today,
+            "next_7_days": next_7_days
+        }
     )
 
-    data = [dict(row._mapping) for row in results]
+    rows = result.mappings().all()
 
-    df = pd.DataFrame(data)
+    if not rows:
+        return {"message": "Không có lịch hẹn nào trong 7 ngày tới"}
 
-    file_path = "upcoming_appointments.csv"
-    df.to_csv(file_path, index=False, encoding="utf-8-sig")
+    # =====================
+    # STREAM CSV (KHÔNG LƯU FILE)
+    # =====================
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
 
-    return FileResponse(
-        path=file_path,
-        filename="upcoming_appointments.csv",
-        media_type="text/csv"
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=upcoming_appointments.csv"
+        }
     )
